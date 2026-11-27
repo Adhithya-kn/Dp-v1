@@ -1631,10 +1631,6 @@ function onDepartureScheduleChanged(isSlider = false) {
   }
 }
 
-function onDestinationChanged() {
-  if (window.playTactileClick) window.playTactileClick();
-}
-
 async function evaluateRoute() {
   const orig = document.getElementById("routeOriginSelect").value;
   const dest = document.getElementById("routeDestSelect").value;
