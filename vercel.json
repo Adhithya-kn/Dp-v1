@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "installCommand": "npm install --include=dev",
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 30,
+      "includeFiles": "{models/xgboost/**,public/**,data/seed_events.json}",
+      "excludeFiles": "{Dataset/**,data/storage/**,models/yolo11/**,node_modules/onnxruntime-node/**,**/*.mp4}"
+    }
+  },
+  "rewrites": [
+    { "source": "/", "destination": "/api/index" },
+    { "source": "/login", "destination": "/api/index" },
+    { "source": "/login/", "destination": "/api/index" },
+    { "source": "/portal", "destination": "/api/index" },
+    { "source": "/portal/", "destination": "/api/index" },
+    { "source": "/synthesizer", "destination": "/api/index" },
+    { "source": "/synthesizer/", "destination": "/api/index" },
+    { "source": "/health", "destination": "/api/index" },
+    { "source": "/api/(.*)", "destination": "/api/index" }
+  ]
+}

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -16,10 +17,23 @@ export class AppDatabase {
     if (opts?.dbPath) {
       this.dbPath = opts.dbPath;
     } else {
-      const storageDir =
+      const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+      let storageDir =
         process.env.PERSISTENT_DATA_DIR?.trim() ||
-        path.join(baseDir, "data", "storage");
-      fs.mkdirSync(storageDir, { recursive: true });
+        (isVercel
+          ? path.join(os.tmpdir(), "smart_traffic")
+          : path.join(baseDir, "data", "storage"));
+      try {
+        fs.mkdirSync(storageDir, { recursive: true });
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        if (code === "EROFS" || code === "EACCES" || code === "EPERM") {
+          storageDir = path.join(os.tmpdir(), "smart_traffic");
+          fs.mkdirSync(storageDir, { recursive: true });
+        } else {
+          throw err;
+        }
+      }
       this.dbPath = path.join(storageDir, "smart_traffic.db");
     }
 

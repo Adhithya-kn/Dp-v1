@@ -597,8 +597,12 @@ export class VisionService {
   ) {
     this.baseDir = baseDir ?? process.cwd();
     this.appDb = appDb;
+    const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
     const storageRoot =
-      process.env.PERSISTENT_DATA_DIR?.trim() || path.join(this.baseDir, "data", "storage");
+      process.env.PERSISTENT_DATA_DIR?.trim() ||
+      (isVercel
+        ? path.join(os.tmpdir(), "smart_traffic")
+        : path.join(this.baseDir, "data", "storage"));
     this.uploadsDir = path.join(storageRoot, "videos", "uploads");
     this.chunksDir = path.join(storageRoot, "videos", "chunks");
     this.frameAnalyzer = options?.frameAnalyzer ?? analyzeFramesWithYolo11;

@@ -1372,6 +1372,15 @@ export function createApp(opts?: AppRuntimeOptions) {
   return app;
 }
 
+let cachedServerlessApp: ReturnType<typeof createApp> | null = null;
+
+export function getApp() {
+  if (!cachedServerlessApp) {
+    cachedServerlessApp = createApp();
+  }
+  return cachedServerlessApp;
+}
+
 // Start server when executed directly
 const isMain =
   process.argv[1] &&

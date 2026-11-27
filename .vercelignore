@@ -1,0 +1,7 @@
+Dataset/
+data/storage/
+*.mp4
+*.webm
+.env
+.env.*
+!.env.example

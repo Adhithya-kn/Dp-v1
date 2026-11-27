@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import * as ort from "onnxruntime-node";
+import type * as Ort from "onnxruntime-node";
 import sharp from "sharp";
 import { roundTo } from "./physics.ts";
 import {
@@ -26,11 +26,19 @@ const COCO_TO_TRAFFIC_CLASS: Record<number, RoadUserClass> = {
 
 interface CachedSession {
   modelPath: string;
-  session: ort.InferenceSession;
+  session: Ort.InferenceSession;
 }
 
 let cachedSession: CachedSession | null = null;
-let loadingPromise: Promise<ort.InferenceSession> | null = null;
+let loadingPromise: Promise<Ort.InferenceSession> | null = null;
+let cachedOrt: typeof Ort | null = null;
+
+async function loadOrt(): Promise<typeof Ort> {
+  if (!cachedOrt) {
+    cachedOrt = await import("onnxruntime-node");
+  }
+  return cachedOrt;
+}
 
 export function resolveYolo11ModelPath(baseDir: string): string {
   const candidates = [
@@ -47,7 +55,7 @@ export function isYolo11ModelReady(baseDir: string): boolean {
   return fs.existsSync(resolveYolo11ModelPath(baseDir));
 }
 
-async function getYolo11Session(baseDir: string): Promise<{ session: ort.InferenceSession; modelName: string }> {
+async function getYolo11Session(baseDir: string): Promise<{ session: Ort.InferenceSession; modelName: string }> {
   const modelPath = resolveYolo11ModelPath(baseDir);
   if (!fs.existsSync(modelPath)) {
     throw new Error(`YOLOv11 ONNX model weights not found at ${modelPath}.`);
@@ -58,10 +66,13 @@ async function getYolo11Session(baseDir: string): Promise<{ session: ort.Inferen
     return { session: cachedSession.session, modelName };
   }
   if (!loadingPromise) {
-    loadingPromise = ort.InferenceSession.create(modelPath, {
-      executionProviders: ["cpu"],
-      graphOptimizationLevel: "all",
-    })
+    loadingPromise = loadOrt()
+      .then((ort) =>
+        ort.InferenceSession.create(modelPath, {
+          executionProviders: ["cpu"],
+          graphOptimizationLevel: "all",
+        })
+      )
       .then((session) => {
         cachedSession = { modelPath, session };
         return session;
@@ -141,7 +152,7 @@ function refineIndianTrafficClass(
 }
 
 async function detectFrameWithYolo11(
-  session: ort.InferenceSession,
+  session: Ort.InferenceSession,
   framePath: string,
   origWidth: number,
   origHeight: number
@@ -177,6 +188,7 @@ async function detectFrameWithYolo11(
 
   const inputName = session.inputNames[0];
   const outputName = session.outputNames[0];
+  const ort = await loadOrt();
   const tensor = new ort.Tensor("float32", floatData, [1, 3, size, size]);
   const outputs = await session.run({ [inputName]: tensor });
   const out = outputs[outputName];
