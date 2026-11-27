@@ -123,10 +123,63 @@ export function verifyPassword(
 export class SecurityManager {
   private appDb: AppDatabase;
   private rateHistory: Map<string, number[]> = new Map();
+  private revokedTokens: Set<string> = new Set();
+  private sessionSecret: Buffer;
 
   constructor(_baseDir: string | undefined, appDb: AppDatabase) {
     this.appDb = appDb;
+    const secretInput =
+      (process.env.SESSION_SECRET || process.env.ADMIN_PASSWORD || "smart-traffic-dev-session-key").trim() ||
+      "smart-traffic-dev-session-key";
+    this.sessionSecret = crypto.createHash("sha256").update(secretInput).digest();
     this.seedInitialUsersIfEmpty();
+  }
+
+  private signStatelessToken(username: string, role: string, createdAt: number, expiresAt: number): string {
+    const payload = Buffer.from(
+      JSON.stringify({
+        u: username,
+        r: role,
+        iat: createdAt,
+        exp: expiresAt,
+        jti: crypto.randomBytes(12).toString("hex"),
+      }),
+      "utf8"
+    ).toString("base64url");
+    const sig = crypto.createHmac("sha256", this.sessionSecret).update(payload).digest("base64url");
+    return `st1.${payload}.${sig}`;
+  }
+
+  private verifyStatelessToken(token: string): SessionRecord | null {
+    if (!token.startsWith("st1.") || this.revokedTokens.has(token)) return null;
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+    const payload = parts[1];
+    const sig = parts[2];
+    if (!payload || !sig) return null;
+    try {
+      const expected = crypto.createHmac("sha256", this.sessionSecret).update(payload).digest("base64url");
+      const a = Buffer.from(sig, "utf8");
+      const b = Buffer.from(expected, "utf8");
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+      const decoded = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as {
+        u?: string;
+        r?: string;
+        iat?: number;
+        exp?: number;
+      };
+      if (!decoded.u || !decoded.r || typeof decoded.exp !== "number") return null;
+      if (decoded.exp < Date.now() / 1000) return null;
+      return {
+        token,
+        username: String(decoded.u),
+        role: String(decoded.r),
+        created_at: Number(decoded.iat ?? Date.now() / 1000),
+        expires_at: decoded.exp,
+      };
+    } catch {
+      return null;
+    }
   }
 
   private seedInitialUsersIfEmpty(): void {
@@ -176,9 +229,9 @@ export class SecurityManager {
       return { ok: false, msg: "Invalid username or password.", session: null };
     }
 
-    const token = crypto.randomBytes(24).toString("hex");
     const createdAt = Date.now() / 1000;
     const expiresAt = createdAt + SESSION_TTL_SEC;
+    const token = this.signStatelessToken(String(row.username), String(row.role), createdAt, expiresAt);
 
     this.appDb.db
       .prepare("INSERT INTO sessions (token, username, role, created_at, expires_at) VALUES (?, ?, ?, ?, ?)")
@@ -199,8 +252,9 @@ export class SecurityManager {
 
   public logout(token: string): boolean {
     if (!token) return false;
+    this.revokedTokens.add(token);
     const res = this.appDb.db.prepare("DELETE FROM sessions WHERE token = ?").run(token);
-    return Number(res.changes ?? 0) > 0;
+    return Number(res.changes ?? 0) > 0 || token.startsWith("st1.");
   }
 
   public register(
@@ -242,11 +296,13 @@ export class SecurityManager {
   }
 
   public getUserByToken(token: string): SessionRecord | null {
-    if (!token) return null;
+    if (!token || this.revokedTokens.has(token)) return null;
     const row = this.appDb.db
       .prepare("SELECT token, username, role, created_at, expires_at FROM sessions WHERE token = ?")
       .get(token) as Record<string, unknown> | undefined;
-    if (!row) return null;
+    if (!row) {
+      return this.verifyStatelessToken(token);
+    }
     const now = Date.now() / 1000;
     if (Number(row.expires_at) < now) {
       this.appDb.db.prepare("DELETE FROM sessions WHERE token = ?").run(token);

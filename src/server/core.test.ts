@@ -177,6 +177,14 @@ test("SQLite persistence survives restarts for users, sessions, events, cameras,
     const restoredUser = sec2.getUserByToken(token);
     assert.equal(restoredUser?.username, "traffic_admin");
 
+    // Cross-instance serverless session verification works even with an empty SQLite sessions table
+    const db3 = new AppDatabase({ dbPath: ":memory:" });
+    const sec3 = new SecurityManager(process.cwd(), db3);
+    const statelessUser = sec3.getUserByToken(token);
+    assert.equal(statelessUser?.username, "traffic_admin");
+    assert.equal(statelessUser?.role, "Traffic Management");
+    db3.close();
+
     // Logout invalidates session in SQLite
     assert.equal(sec2.logout(token), true);
     assert.equal(sec2.getUserByToken(token), null);

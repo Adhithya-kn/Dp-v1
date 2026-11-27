@@ -553,6 +553,20 @@
     let isRegisterMode = false;
     let isSubmitting = false;
 
+    (async function checkAuthHint() {
+      try {
+        const res = await fetch("/api/auth/config");
+        if (!res.ok) return;
+        const cfg = await res.json();
+        const hint = document.getElementById("hintBox");
+        if (hint && cfg && cfg.default_credentials_active === false) {
+          hint.innerHTML = "Operator sign-in: use your configured <code>ADMIN_USERNAME</code> &amp; <code>ADMIN_PASSWORD</code>, or click <strong>Sign up</strong> for a Road User account.";
+        }
+      } catch {
+        // Ignore non-fatal hint check
+      }
+    })();
+
     (async function checkExistingSession() {
       const savedUser = localStorage.getItem("traffic_ai_user");
       if (!savedUser) return;

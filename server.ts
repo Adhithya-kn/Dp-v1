@@ -370,6 +370,15 @@ export function createApp(opts?: AppRuntimeOptions) {
   // -------------------------------------------------------------------------
   // Auth Routes
   // -------------------------------------------------------------------------
+  app.get("/api/auth/config", (_req, res) => {
+    const adminPwd = (process.env.ADMIN_PASSWORD || "Admin@123").trim() || "Admin@123";
+    res.json({
+      success: true,
+      default_credentials_active: adminPwd === "Admin@123",
+      timestamp: nowIso(),
+    });
+  });
+
   app.post("/api/auth/login", (req, res) => {
     const clientIp = req.ip || req.socket.remoteAddress || "unknown";
     const rl = security.checkRateLimit("login", clientIp, 30, 60);
