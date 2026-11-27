@@ -1,0 +1,8 @@
+{
+  "name": "Smart Traffic AI",
+  "description": "Bengaluru Metropolitan Traffic Operations — live corridor monitoring, XGBoost congestion prediction, tri-pillar heatmaps, computer-vision analytics, policy simulation, and dynamic rerouting.",
+  "requestFramePermissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

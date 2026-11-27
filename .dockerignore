@@ -1,0 +1,12 @@
+node_modules
+.git
+.github
+.env
+.env.*
+data/storage
+public/assets/aistudio
+.playwright-cli
+.aistudio
+*.log
+.DS_Store
+Thumbs.db

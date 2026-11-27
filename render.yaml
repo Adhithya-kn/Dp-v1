@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: smart-traffic-ops
+    runtime: docker
+    plan: standard
+    healthCheckPath: /health
+    disk:
+      name: traffic-storage
+      mountPath: /var/data
+      sizeGB: 5
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"
+      - key: PERSISTENT_DATA_DIR
+        value: /var/data
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: GOOGLE_MAPS_BROWSER_KEY
+        sync: false
+      - key: GOOGLE_MAPS_MAP_ID
+        sync: false
+      - key: TOMTOM_API_KEY
+        sync: false

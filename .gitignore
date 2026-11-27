@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+dist/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Runtime data (SQLite DB, WAL files, uploaded videos & chunks)
+data/storage/
+
+# Local tools & OS files
+.playwright-cli/
+.aistudio/
+public/assets/aistudio/
+*.log
+.DS_Store
+Thumbs.db
