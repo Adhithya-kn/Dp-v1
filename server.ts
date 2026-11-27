@@ -1381,9 +1381,14 @@ export function getApp() {
   return cachedServerlessApp;
 }
 
-// Start server when executed directly
+const defaultApp = getApp();
+export default defaultApp;
+
+// Start server when executed directly (never on Vercel serverless)
 const isMain =
-  process.argv[1] &&
+  !process.env.VERCEL &&
+  !process.env.VERCEL_ENV &&
+  Boolean(process.argv[1]) &&
   (path.resolve(process.argv[1]) === path.resolve(new URL(import.meta.url).pathname) ||
     process.argv[1].endsWith("server.ts"));
 
@@ -1393,8 +1398,7 @@ if (isMain) {
     (process.env.NODE_ENV === "production" ? Number(process.env.PORT) : 0) ||
     3000;
   const HOST = "0.0.0.0";
-  const app = createApp();
-  app.listen(PORT, HOST, () => {
+  defaultApp.listen(PORT, HOST, () => {
     console.log(`=================================================================`);
     console.log(` Smart Traffic AI Server Live on http://${HOST}:${PORT}`);
     console.log(` Bengaluru Metropolitan Traffic Operations Portal Active`);

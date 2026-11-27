@@ -3,9 +3,14 @@
   "version": 2,
   "installCommand": "npm install --include=dev",
   "functions": {
+    "server.ts": {
+      "maxDuration": 30,
+      "includeFiles": "{models/xgboost/**,public/**}",
+      "excludeFiles": "{Dataset/**,data/storage/**,models/yolo11/**,node_modules/onnxruntime-node/**,**/*.mp4}"
+    },
     "api/index.ts": {
       "maxDuration": 30,
-      "includeFiles": "{models/xgboost/**,public/**,data/seed_events.json}",
+      "includeFiles": "{models/xgboost/**,public/**}",
       "excludeFiles": "{Dataset/**,data/storage/**,models/yolo11/**,node_modules/onnxruntime-node/**,**/*.mp4}"
     }
   },
@@ -13,10 +18,24 @@
     { "source": "/", "destination": "/api/index" },
     { "source": "/login", "destination": "/api/index" },
     { "source": "/login/", "destination": "/api/index" },
+    { "source": "/signin", "destination": "/api/index" },
+    { "source": "/login.html", "destination": "/api/index" },
     { "source": "/portal", "destination": "/api/index" },
     { "source": "/portal/", "destination": "/api/index" },
+    { "source": "/dashboard", "destination": "/api/index" },
+    { "source": "/app", "destination": "/api/index" },
+    { "source": "/traffic", "destination": "/api/index" },
+    { "source": "/heatmap", "destination": "/api/index" },
+    { "source": "/vision", "destination": "/api/index" },
+    { "source": "/live_traffic", "destination": "/api/index" },
+    { "source": "/live-traffic", "destination": "/api/index" },
+    { "source": "/monitor", "destination": "/api/index" },
+    { "source": "/predict", "destination": "/api/index" },
+    { "source": "/decide", "destination": "/api/index" },
     { "source": "/synthesizer", "destination": "/api/index" },
     { "source": "/synthesizer/", "destination": "/api/index" },
+    { "source": "/guides/(.*)", "destination": "/api/index" },
+    { "source": "/architecture/(.*)", "destination": "/api/index" },
     { "source": "/health", "destination": "/api/index" },
     { "source": "/api/(.*)", "destination": "/api/index" }
   ]
