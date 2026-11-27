@@ -2180,30 +2180,62 @@ export interface WeatherState {
   fetched_at: string;
 }
 
+export type ProviderConnectionState =
+  | "CONNECTED"
+  | "CONFIGURED"
+  | "NOT_CONFIGURED"
+  | "INVALID_CREDENTIALS"
+  | "API_DISABLED_OR_RESTRICTED"
+  | "CONFIGURED_UNREACHABLE";
+
+interface ProviderRuntimeMeta {
+  connection_state: ProviderConnectionState;
+  currently_reachable: boolean;
+  last_latency_ms: number | null;
+  key_source: string;
+}
+
 export class ApiManager {
   public tomtomKey: string;
   public googleMapsKey: string;
   public weatherBaseUrl: string;
   private appDb: AppDatabase;
+  private tomtomMeta: ProviderRuntimeMeta;
+  private googleMapsMeta: ProviderRuntimeMeta;
+  private weatherMeta: ProviderRuntimeMeta;
 
   constructor(appDb: AppDatabase) {
     this.appDb = appDb;
-    const savedTomTom = this.readConfig("tomtom_api_key");
-    const savedGmaps = this.readConfig("google_maps_api_key");
-    const savedWeather = this.readConfig("weather_base_url");
+    const savedTomTom = this.readConfig("tomtom_api_key").trim();
+    const savedGmaps = this.readConfig("google_maps_api_key").trim();
+    const savedWeather = this.readConfig("weather_base_url").trim();
 
-    this.tomtomKey = (process.env.TOMTOM_API_KEY || savedTomTom || "").trim();
-    this.googleMapsKey = (
-      process.env.GOOGLE_MAPS_BROWSER_KEY ||
-      process.env.GOOGLE_MAPS_API_KEY ||
-      savedGmaps ||
-      ""
-    ).trim();
-    this.weatherBaseUrl = (
-      process.env.OPEN_METEO_URL ||
-      savedWeather ||
-      "https://api.open-meteo.com/v1/forecast"
-    ).trim();
+    const envTomTom = (process.env.TOMTOM_API_KEY || "").trim();
+    const envGmaps = (process.env.GOOGLE_MAPS_BROWSER_KEY || process.env.GOOGLE_MAPS_API_KEY || "").trim();
+    const envWeather = (process.env.OPEN_METEO_URL || "").trim();
+
+    this.tomtomKey = envTomTom || savedTomTom;
+    this.googleMapsKey = envGmaps || savedGmaps;
+    this.weatherBaseUrl = envWeather || savedWeather || "https://api.open-meteo.com/v1/forecast";
+
+    this.tomtomMeta = {
+      connection_state: this.tomtomKey.length >= 12 ? "CONFIGURED" : "NOT_CONFIGURED",
+      currently_reachable: false,
+      last_latency_ms: null,
+      key_source: envTomTom ? "Server (.env)" : savedTomTom ? "Admin Override (DB)" : "Unconfigured",
+    };
+    this.googleMapsMeta = {
+      connection_state: this.googleMapsKey.length >= 12 ? "CONFIGURED" : "NOT_CONFIGURED",
+      currently_reachable: false,
+      last_latency_ms: null,
+      key_source: envGmaps ? "Server (.env)" : savedGmaps ? "Admin Override (DB)" : "Unconfigured",
+    };
+    this.weatherMeta = {
+      connection_state: "CONFIGURED",
+      currently_reachable: false,
+      last_latency_ms: null,
+      key_source: envWeather ? "Server (.env)" : savedWeather ? "Admin Override (DB)" : "Default (Open-Meteo)",
+    };
   }
 
   private readConfig(key: string): string {
@@ -2238,20 +2270,28 @@ export class ApiManager {
         configured: this.tomtomKey.length >= 12,
         masked_key: this.maskKey(this.tomtomKey),
         status: this.tomtomKey.length >= 12 ? "configured" : "baseline_fallback",
+        ...this.tomtomMeta,
       },
       google_maps: {
         name: "Google Maps & Routes API v2",
         configured: this.googleMapsKey.length >= 12,
         masked_key: this.maskKey(this.googleMapsKey),
         status: this.googleMapsKey.length >= 12 ? "configured" : "canvas_fallback",
+        ...this.googleMapsMeta,
       },
       weather: {
         name: "Open-Meteo Bengaluru Weather API",
         configured: true,
         base_url: this.weatherBaseUrl,
         status: "live_ready",
+        ...this.weatherMeta,
       },
     };
+  }
+
+  public getProvidersList() {
+    const p = this.getProviders();
+    return [p.google_maps, p.tomtom, p.weather];
   }
 
   public getStatus() {
@@ -2275,12 +2315,26 @@ export class ApiManager {
   public updateTomTomKey(key: string) {
     this.tomtomKey = String(key || "").trim();
     this.writeConfig("tomtom_api_key", this.tomtomKey);
+    const configured = this.tomtomKey.length >= 12;
+    this.tomtomMeta = {
+      connection_state: configured ? "CONFIGURED" : "NOT_CONFIGURED",
+      currently_reachable: false,
+      last_latency_ms: null,
+      key_source: configured ? "Admin Override (DB)" : "Unconfigured",
+    };
     return { ok: true, msg: "TomTom API configuration persisted.", data: this.getProviders().tomtom };
   }
 
   public updateGoogleMapsKey(key: string) {
     this.googleMapsKey = String(key || "").trim();
     this.writeConfig("google_maps_api_key", this.googleMapsKey);
+    const configured = this.googleMapsKey.length >= 12;
+    this.googleMapsMeta = {
+      connection_state: configured ? "CONFIGURED" : "NOT_CONFIGURED",
+      currently_reachable: false,
+      last_latency_ms: null,
+      key_source: configured ? "Admin Override (DB)" : "Unconfigured",
+    };
     return { ok: true, msg: "Google Maps configuration persisted.", data: this.getProviders().google_maps };
   }
 
@@ -2292,6 +2346,7 @@ export class ApiManager {
       }
       this.weatherBaseUrl = trimmed;
       this.writeConfig("weather_base_url", this.weatherBaseUrl);
+      this.weatherMeta.key_source = "Admin Override (DB)";
     }
     return { ok: true, msg: "Weather configuration persisted.", data: this.getProviders().weather };
   }
@@ -2309,6 +2364,9 @@ export class ApiManager {
       const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
       const latencyMs = Math.round(performance.now() - t0);
       if (!resp.ok) {
+        this.weatherMeta.currently_reachable = false;
+        this.weatherMeta.last_latency_ms = latencyMs;
+        this.weatherMeta.connection_state = "CONFIGURED_UNREACHABLE";
         return {
           ok: false,
           latency_ms: latencyMs,
@@ -2340,6 +2398,9 @@ export class ApiManager {
         source: "Open-Meteo Live API",
         fetched_at: nowIso(),
       };
+      this.weatherMeta.currently_reachable = true;
+      this.weatherMeta.last_latency_ms = latencyMs;
+      this.weatherMeta.connection_state = "CONNECTED";
       return {
         ok: true,
         latency_ms: latencyMs,
@@ -2348,9 +2409,13 @@ export class ApiManager {
         weather,
       };
     } catch (err) {
+      const latencyMs = Math.round(performance.now() - t0);
+      this.weatherMeta.currently_reachable = false;
+      this.weatherMeta.last_latency_ms = latencyMs;
+      this.weatherMeta.connection_state = "CONFIGURED_UNREACHABLE";
       return {
         ok: false,
-        latency_ms: Math.round(performance.now() - t0),
+        latency_ms: latencyMs,
         http_status: null,
         message: `Open-Meteo unreachable: ${err instanceof Error ? err.message : "network error"}`,
       };
@@ -2366,6 +2431,9 @@ export class ApiManager {
     sample_speed_kmh?: number;
   }> {
     if (this.tomtomKey.length < 12) {
+      this.tomtomMeta.currently_reachable = false;
+      this.tomtomMeta.last_latency_ms = null;
+      this.tomtomMeta.connection_state = "NOT_CONFIGURED";
       return {
         ok: false,
         configured: false,
@@ -2380,6 +2448,10 @@ export class ApiManager {
       const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
       const latencyMs = Math.round(performance.now() - t0);
       if (!resp.ok) {
+        this.tomtomMeta.currently_reachable = false;
+        this.tomtomMeta.last_latency_ms = latencyMs;
+        this.tomtomMeta.connection_state =
+          resp.status === 401 || resp.status === 403 ? "INVALID_CREDENTIALS" : "CONFIGURED_UNREACHABLE";
         return {
           ok: false,
           configured: true,
@@ -2390,6 +2462,9 @@ export class ApiManager {
       }
       const data = (await resp.json()) as { flowSegmentData?: { currentSpeed?: number } };
       const spd = data.flowSegmentData?.currentSpeed;
+      this.tomtomMeta.currently_reachable = true;
+      this.tomtomMeta.last_latency_ms = latencyMs;
+      this.tomtomMeta.connection_state = "CONNECTED";
       return {
         ok: true,
         configured: true,
@@ -2399,10 +2474,14 @@ export class ApiManager {
         message: `TomTom Flow API live (Indiranagar speed: ${spd ?? "--"} km/h, ${latencyMs}ms).`,
       };
     } catch (err) {
+      const latencyMs = Math.round(performance.now() - t0);
+      this.tomtomMeta.currently_reachable = false;
+      this.tomtomMeta.last_latency_ms = latencyMs;
+      this.tomtomMeta.connection_state = "CONFIGURED_UNREACHABLE";
       return {
         ok: false,
         configured: true,
-        latency_ms: Math.round(performance.now() - t0),
+        latency_ms: latencyMs,
         http_status: null,
         message: `TomTom probe error: ${err instanceof Error ? err.message : "network error"}`,
       };
@@ -2417,6 +2496,9 @@ export class ApiManager {
     message: string;
   }> {
     if (this.googleMapsKey.length < 12) {
+      this.googleMapsMeta.currently_reachable = false;
+      this.googleMapsMeta.last_latency_ms = null;
+      this.googleMapsMeta.connection_state = "NOT_CONFIGURED";
       return {
         ok: false,
         configured: false,
@@ -2444,6 +2526,14 @@ export class ApiManager {
       });
       const latencyMs = Math.round(performance.now() - t0);
       if (!resp.ok) {
+        this.googleMapsMeta.currently_reachable = false;
+        this.googleMapsMeta.last_latency_ms = latencyMs;
+        this.googleMapsMeta.connection_state =
+          resp.status === 401
+            ? "INVALID_CREDENTIALS"
+            : resp.status === 403
+              ? "API_DISABLED_OR_RESTRICTED"
+              : "CONFIGURED_UNREACHABLE";
         return {
           ok: false,
           configured: true,
@@ -2452,6 +2542,9 @@ export class ApiManager {
           message: `Google Routes API returned HTTP ${resp.status}.`,
         };
       }
+      this.googleMapsMeta.currently_reachable = true;
+      this.googleMapsMeta.last_latency_ms = latencyMs;
+      this.googleMapsMeta.connection_state = "CONNECTED";
       return {
         ok: true,
         configured: true,
@@ -2460,10 +2553,14 @@ export class ApiManager {
         message: `Google Routes API v2 reachable (${latencyMs}ms).`,
       };
     } catch (err) {
+      const latencyMs = Math.round(performance.now() - t0);
+      this.googleMapsMeta.currently_reachable = false;
+      this.googleMapsMeta.last_latency_ms = latencyMs;
+      this.googleMapsMeta.connection_state = "CONFIGURED_UNREACHABLE";
       return {
         ok: false,
         configured: true,
-        latency_ms: Math.round(performance.now() - t0),
+        latency_ms: latencyMs,
         http_status: null,
         message: `Google Maps probe error: ${err instanceof Error ? err.message : "network error"}`,
       };

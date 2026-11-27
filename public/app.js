@@ -2873,8 +2873,15 @@ async function initCommuterHeatmap() {
       gMap.setCenter({ lat: target.lat, lng: target.lng });
       loadCorridorNetwork();
       loadCongestionHeatmap();
-    } else if (typeof tryMountGoogleMap === "function") {
-      tryMountGoogleMap();
+    } else {
+      if (typeof tryMountGoogleMap === "function") {
+        tryMountGoogleMap();
+      }
+      loadCongestionHeatmap();
+      const canvas = document.getElementById("googleMapCanvas");
+      if (canvas && (!canvas.querySelector(".vector-fallback-canvas") || !vectorCanvasAnimFrame)) {
+        initVectorFallbackMap(canvas);
+      }
     }
   }, 120);
 }
@@ -4600,15 +4607,19 @@ async function loadApiProviderStatuses() {
   try {
     const res = await fetch("/api/config/providers");
     const data = await res.json();
-    if (!data || !data.providers) return;
+    const providers = Array.isArray(data?.providers)
+      ? data.providers
+      : (data?.data && typeof data.data === "object" ? Object.values(data.data) : null);
+    if (!providers || providers.length === 0) return;
 
     let allConnected = true;
     let anyConfigured = false;
     let anyFailed = false;
 
-    data.providers.forEach(p => {
+    providers.forEach(p => {
       const isGoogle = p.name && p.name.includes("Google Maps");
       const isTomTom = p.name && p.name.includes("TomTom");
+      if (!isGoogle && !isTomTom) return;
 
       if (p.configured) anyConfigured = true;
       if (p.connection_state === "CONFIGURED_UNREACHABLE" || p.connection_state === "INVALID_CREDENTIALS" || p.connection_state === "API_DISABLED_OR_RESTRICTED") {
@@ -4629,7 +4640,7 @@ async function loadApiProviderStatuses() {
         const state = p.connection_state || (p.configured ? (p.currently_reachable ? "CONNECTED" : "CONFIGURED") : "NOT_CONFIGURED");
         if (stateEl) stateEl.textContent = state;
         if (latEl) latEl.textContent = p.last_latency_ms ? `${p.last_latency_ms} ms` : (p.currently_reachable ? "24 ms" : "--");
-        if (srcEl) srcEl.textContent = p.configured ? "Server (.env)" : "Unconfigured";
+        if (srcEl) srcEl.textContent = p.key_source || (p.configured ? "Server (.env)" : "Unconfigured");
 
         if (statusBadge) {
           if (state === "CONNECTED" || p.currently_reachable) {
@@ -4662,7 +4673,7 @@ async function loadApiProviderStatuses() {
         const state = p.connection_state || (p.configured ? (p.currently_reachable ? "CONNECTED" : "CONFIGURED") : "NOT_CONFIGURED");
         if (stateEl) stateEl.textContent = state;
         if (latEl) latEl.textContent = p.last_latency_ms ? `${p.last_latency_ms} ms` : (p.currently_reachable ? "36 ms" : "--");
-        if (srcEl) srcEl.textContent = p.configured ? "Server (.env)" : "Unconfigured";
+        if (srcEl) srcEl.textContent = p.key_source || (p.configured ? "Server (.env)" : "Unconfigured");
 
         if (statusBadge) {
           if (state === "CONNECTED" || p.currently_reachable) {
@@ -4768,6 +4779,7 @@ async function testGoogleMapsKey() {
   try {
     const res = await fetch("/api/config/test/google_maps", { method: "POST" });
     const data = await res.json();
+    await loadApiProviderStatuses();
     if (data.success) {
       const latTxt = typeof data.latency_ms === "number" ? ` (${data.latency_ms}ms)` : "";
       showToast(data.message || `Google Maps reachable${latTxt}`, "success");
@@ -4815,6 +4827,7 @@ async function testTomTomKey() {
   try {
     const res = await fetch("/api/config/test/tomtom", { method: "POST" });
     const data = await res.json();
+    await loadApiProviderStatuses();
     if (data.success) {
       const latTxt = typeof data.latency_ms === "number" ? ` (${data.latency_ms}ms)` : "";
       showToast(data.message || `TomTom reachable${latTxt}`, "success");
@@ -4832,6 +4845,7 @@ async function testWeatherKey() {
   try {
     const res = await fetch("/api/config/test/weather", { method: "POST" });
     const data = await res.json();
+    await loadApiProviderStatuses();
     if (data.success) {
       const latTxt = typeof data.latency_ms === "number" ? ` (${data.latency_ms}ms)` : "";
       showToast(data.message || `Weather API responsive${latTxt}`, "success");

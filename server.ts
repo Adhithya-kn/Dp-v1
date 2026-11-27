@@ -33,6 +33,35 @@ import { VisionService } from "./src/server/visionService.ts";
 
 const BASE_DIR = process.cwd();
 
+function loadLocalEnvFile(baseDir: string): void {
+  const envPath = path.join(baseDir, ".env");
+  if (!fs.existsSync(envPath)) return;
+  try {
+    const raw = fs.readFileSync(envPath, "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const eqIdx = trimmed.indexOf("=");
+      if (eqIdx <= 0) continue;
+      const key = trimmed.slice(0, eqIdx).trim();
+      let val = trimmed.slice(eqIdx + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      if (process.env[key] === undefined || process.env[key] === "") {
+        process.env[key] = val;
+      }
+    }
+  } catch {
+    // Non-fatal if .env is unreadable
+  }
+}
+
+loadLocalEnvFile(BASE_DIR);
+
 export interface AppRuntimeOptions {
   baseDir?: string;
   dbPath?: string;
@@ -992,7 +1021,13 @@ export function createApp(opts?: AppRuntimeOptions) {
   });
 
   app.get("/api/config/providers", (_req, res) => {
-    res.json({ success: true, status: "success", timestamp: nowIso(), data: apiManager.getProviders() });
+    res.json({
+      success: true,
+      status: "success",
+      timestamp: nowIso(),
+      data: apiManager.getProviders(),
+      providers: apiManager.getProvidersList(),
+    });
   });
   app.get("/api/config/status", (_req, res) => {
     res.json({ success: true, status: "success", timestamp: nowIso(), data: apiManager.getStatus() });
