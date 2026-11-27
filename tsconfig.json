@@ -9,8 +9,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "noEmit": true,
-    "types": ["node"]
+    "noEmit": true
   },
   "include": ["server.ts", "api/**/*.ts", "src/**/*.ts"],
   "exclude": ["node_modules", "public", "data", "models"]
