@@ -4870,26 +4870,45 @@ let visionActiveTelemetry = null;
 let visionShowRoi = true;
 let visionPlaybackRate = 1.0;
 let currentVisionJobId = null;
+let visionServerCapabilities = null;
+
+async function fetchVisionCapabilities() {
+  try {
+    const r = await fetch("/api/vision/status");
+    const data = await r.json();
+    if (data.success && data.data) {
+      visionServerCapabilities = data.data;
+      return data.data;
+    }
+  } catch (err) {
+    console.warn("Vision status check:", err);
+  }
+  return visionServerCapabilities;
+}
 
 function initVisionIntelligenceSection() {
   populateActuationCorridors();
   setupVisionDragAndDrop();
 
   // Check engine readiness via API
-  fetch("/api/vision/status")
-    .then(r => r.json())
-    .then(data => {
-      if (data.success && data.data) {
-        const ready = Boolean(data.data.yolo_loaded);
-        const eng = data.data.engine || "Ultralytics YOLOv11s (ONNX) + IoU Tracker";
-        const engBadge = document.getElementById("kpiVisionEngine");
-        if (engBadge) engBadge.textContent = ready ? "YOLOv11s" : "Unavailable";
-        const statusTxt = document.getElementById("visionStatusText");
-        if (statusTxt) statusTxt.textContent = `Vision engine: ${eng}`;
-        setProvenanceBadge("cvProvEngine", ready ? "live" : "uncalibrated", ready ? "LIVE YOLOv11" : "UNAVAILABLE");
-      }
-    })
-    .catch(err => console.warn("Vision status check:", err));
+  fetchVisionCapabilities().then(cap => {
+    if (!cap) return;
+    const ready = Boolean(cap.yolo_loaded);
+    const eng = cap.engine || "Ultralytics YOLOv11s (ONNX) + IoU Tracker";
+    const engBadge = document.getElementById("kpiVisionEngine");
+    if (engBadge) engBadge.textContent = ready ? "YOLOv11s" : "Unavailable";
+    const devBadge = document.getElementById("kpiVisionDevice");
+    if (devBadge && ready) {
+      devBadge.textContent = cap.browser_frame_mode ? "ONNX Runtime (Serverless)" : "ONNX Runtime (CPU)";
+    }
+    const statusTxt = document.getElementById("visionStatusText");
+    if (statusTxt) {
+      statusTxt.textContent = cap.browser_frame_mode
+        ? `Vision engine: ${eng} (Cloud Frame Mode)`
+        : `Vision engine: ${eng}`;
+    }
+    setProvenanceBadge("cvProvEngine", ready ? "live" : "uncalibrated", ready ? "LIVE YOLOv11" : "UNAVAILABLE");
+  });
 }
 
 function populateActuationCorridors(forceRefresh = false) {
@@ -4996,6 +5015,15 @@ async function uploadVisionVideo(file) {
   let videoId = null;
 
   try {
+    const caps = visionServerCapabilities || (await fetchVisionCapabilities());
+    if (caps && caps.yolo_loaded === false) {
+      throw new Error("YOLOv11s ONNX model weights are unavailable on the server.");
+    }
+    if (caps && (caps.browser_frame_mode || caps.ffmpeg_available === false)) {
+      await runBrowserKeyframeVisionPipeline(file, { progressFill, progressText, statusText });
+      return;
+    }
+
     let useChunked = file.size > DIRECT_UPLOAD_LIMIT;
 
     if (!useChunked) {
@@ -5334,23 +5362,17 @@ function pollVisionJob(jobId, videoId) {
   }, 750);
 }
 
-async function onVisionJobComplete(jobId) {
-  try {
-    const res = await fetch(`/api/vision/results/${jobId}`, {
-      headers: { "Authorization": getAuthHeader() }
-    });
-    const data = await res.json();
-    if (!res.ok || !data.success) return;
+function applyVisionResultsToUI(results, opts = {}) {
+  if (!results) return;
+  visionActiveTelemetry = results;
 
-    const results = data.data;
-    visionActiveTelemetry = results;
-
-    // Load annotated video for playback
-    const video = document.getElementById("visionVideoElement");
-    if (video) {
-      clearVisionHud();
+  const video = document.getElementById("visionVideoElement");
+  if (video) {
+    clearVisionHud();
+    const keepLocal = Boolean(opts.keepLocalVideo || results.client_frame_pipeline);
+    if (!keepLocal && currentVisionJobId) {
       const token = (currentUser && currentUser.token) || "";
-      const streamUrl = `/api/vision/video/${jobId}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+      const streamUrl = `/api/vision/video/${currentVisionJobId}${token ? `?token=${encodeURIComponent(token)}` : ''}`;
       const currentSrc = video.src;
       video.src = streamUrl;
       video.loop = true;
@@ -5364,22 +5386,222 @@ async function onVisionJobComplete(jobId) {
         }
       });
     }
+  }
 
-    // Render waveform and telemetry cards
-    renderWaveform(results.sample_telemetry || []);
-    updateVisionSidecar(
-      results.pcu_telemetry || {},
-      results.kinematics || {},
-      results.traffic_density || {},
-      results.incident_summary || {},
-      results.class_counts || {},
-      results.total_unique_vehicles || 0,
-      results.confidence_summary || {},
-      results.processing_metrics || {},
-      results.route_flow || {},
-      results
-    );
-    renderVisionHudFrame();
+  // Render waveform and telemetry cards
+  renderWaveform(results.sample_telemetry || []);
+  updateVisionSidecar(
+    results.pcu_telemetry || {},
+    results.kinematics || {},
+    results.traffic_density || {},
+    results.incident_summary || {},
+    results.class_counts || {},
+    results.total_unique_vehicles || 0,
+    results.confidence_summary || {},
+    results.processing_metrics || {},
+    results.route_flow || {},
+    results
+  );
+  renderVisionHudFrame();
+}
+
+async function extractVideoKeyframesInBrowser(file, maxFrames = 16, onProgress) {
+  const objUrl = URL.createObjectURL(file);
+  const vid = document.createElement("video");
+  vid.muted = true;
+  vid.playsInline = true;
+  vid.preload = "auto";
+  vid.src = objUrl;
+
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("Timed out reading video metadata in browser.")), 15000);
+      vid.onloadedmetadata = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      vid.onerror = () => {
+        clearTimeout(timer);
+        reject(new Error("Browser cannot decode this video format. Please upload an MP4 or WebM (H.264/VP8/VP9) file."));
+      };
+    });
+
+    const rawDuration = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 10;
+    const width = vid.videoWidth || 1280;
+    const height = vid.videoHeight || 720;
+    const scale = Math.min(1, 960 / Math.max(width, 1));
+    const targetW = Math.max(64, Math.round(width * scale));
+    const targetH = Math.max(64, Math.round(height * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas 2D context unavailable for frame extraction.");
+
+    const numFrames = Math.min(maxFrames, Math.max(6, Math.round(rawDuration)));
+    const safeStart = Math.min(0.15, rawDuration * 0.05);
+    const safeEnd = Math.max(safeStart + 0.1, rawDuration - safeStart);
+    const frames = [];
+
+    for (let i = 0; i < numFrames; i++) {
+      const frac = numFrames > 1 ? i / (numFrames - 1) : 0;
+      const ts = Number((safeStart + frac * (safeEnd - safeStart)).toFixed(3));
+      await new Promise((resolve, reject) => {
+        const seekTimer = setTimeout(() => reject(new Error(`Frame seek timed out at ${ts}s.`)), 8000);
+        const handleSeeked = () => {
+          clearTimeout(seekTimer);
+          vid.removeEventListener("seeked", handleSeeked);
+          resolve();
+        };
+        vid.addEventListener("seeked", handleSeeked);
+        vid.currentTime = ts;
+      });
+      ctx.drawImage(vid, 0, 0, targetW, targetH);
+      const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+      frames.push({
+        frame_index: i,
+        timestamp_sec: ts,
+        image_base64: dataUrl
+      });
+      if (typeof onProgress === "function") {
+        onProgress(i + 1, numFrames);
+      }
+    }
+
+    return {
+      width,
+      height,
+      duration_seconds: Number(rawDuration.toFixed(2)),
+      fps: 30,
+      frames
+    };
+  } finally {
+    vid.removeAttribute("src");
+    vid.load();
+    URL.revokeObjectURL(objUrl);
+  }
+}
+
+async function runBrowserKeyframeVisionPipeline(file, ui) {
+  const { progressFill, progressText, statusText } = ui;
+  const tStart = performance.now();
+
+  if (statusText) statusText.textContent = `Decoding keyframes from ${file.name} in browser...`;
+  const extracted = await extractVideoKeyframesInBrowser(file, 16, (done, total) => {
+    const pct = Math.round(5 + (done / total) * 35);
+    if (progressFill) progressFill.style.width = `${pct}%`;
+    if (progressText) progressText.textContent = `${pct}%`;
+    if (statusText) statusText.textContent = `Extracting keyframes (${done}/${total})...`;
+  });
+
+  const BATCH_SIZE = 4;
+  const allFrameDetections = [];
+  let modelUsed = "Ultralytics YOLO11S (ONNX)";
+  const totalFrames = extracted.frames.length;
+
+  for (let start = 0; start < totalFrames; start += BATCH_SIZE) {
+    const batch = extracted.frames.slice(start, start + BATCH_SIZE);
+    const doneBefore = start;
+    if (statusText) {
+      statusText.textContent = `Running Ultralytics YOLOv11s (ONNX) inference (${Math.min(start + BATCH_SIZE, totalFrames)}/${totalFrames} frames)...`;
+    }
+
+    let detRes = await fetch("/api/vision/detect-frames", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": getAuthHeader()
+      },
+      body: JSON.stringify({
+        width: extracted.width,
+        height: extracted.height,
+        frames: batch
+      })
+    });
+
+    if (detRes.status === 401) {
+      const refreshedToken = await autoRefreshAuthSession();
+      if (refreshedToken) {
+        detRes = await fetch("/api/vision/detect-frames", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": getAuthHeader()
+          },
+          body: JSON.stringify({
+            width: extracted.width,
+            height: extracted.height,
+            frames: batch
+          })
+        });
+      }
+    }
+
+    const detData = await detRes.json().catch(() => ({}));
+    if (!detRes.ok || !detData.success) {
+      throw new Error(detData.message || `YOLOv11s frame inference failed (${detRes.status})`);
+    }
+
+    if (detData.data?.model_used) modelUsed = detData.data.model_used;
+    const batchFrames = Array.isArray(detData.data?.frames) ? detData.data.frames : [];
+    allFrameDetections.push(...batchFrames);
+
+    const processedNow = Math.min(doneBefore + batch.length, totalFrames);
+    const pct = Math.round(40 + (processedNow / totalFrames) * 50);
+    if (progressFill) progressFill.style.width = `${pct}%`;
+    if (progressText) progressText.textContent = `${pct}%`;
+  }
+
+  if (statusText) statusText.textContent = "Computing IoU tracks & Indo-HCM PCU telemetry...";
+  if (progressFill) progressFill.style.width = "94%";
+  if (progressText) progressText.textContent = "94%";
+
+  const elapsedSec = Number(((performance.now() - tStart) / 1000).toFixed(2));
+  const finRes = await fetch("/api/vision/finalize-frames", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": getAuthHeader()
+    },
+    body: JSON.stringify({
+      filename: file.name,
+      file_size_bytes: file.size,
+      width: extracted.width,
+      height: extracted.height,
+      fps: extracted.fps,
+      duration_seconds: extracted.duration_seconds,
+      model_used: modelUsed,
+      client_elapsed_sec: elapsedSec,
+      frame_detections: allFrameDetections
+    })
+  });
+
+  const finData = await finRes.json().catch(() => ({}));
+  if (!finRes.ok || !finData.success) {
+    throw new Error(finData.message || `Failed to finalize telemetry (${finRes.status})`);
+  }
+
+  currentVisionJobId = finData.data.job_id;
+  if (progressFill) {
+    progressFill.style.width = "100%";
+    progressFill.style.background = "var(--status-low)";
+  }
+  if (progressText) progressText.textContent = "100%";
+  if (statusText) statusText.textContent = "Ultralytics YOLOv11s vehicle count & tracking report complete!";
+  showToast("Ultralytics YOLOv11s vehicle count report completed!", "success");
+  playSuccessChime();
+  applyVisionResultsToUI(finData.data.results, { keepLocalVideo: true });
+}
+
+async function onVisionJobComplete(jobId) {
+  try {
+    const res = await fetch(`/api/vision/results/${jobId}`, {
+      headers: { "Authorization": getAuthHeader() }
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) return;
+    applyVisionResultsToUI(data.data, { keepLocalVideo: false });
   } catch (err) {
     console.error("Failed to fetch results:", err);
   }
@@ -6063,24 +6285,62 @@ function updateLiveSidecarMetrics(data) {
 }
 
 async function downloadVisionTelemetry(format = "csv") {
-  if (!currentVisionJobId) {
+  if (!currentVisionJobId && !visionActiveTelemetry) {
     showToast("No completed video processing job available to export.", "error");
     return;
   }
   try {
-    const token = (currentUser && currentUser.token) || "";
-    const res = await fetch(`/api/vision/export/${currentVisionJobId}?format=${format}`, {
-      headers: token ? { "Authorization": `Bearer ${token}` } : {}
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.message || `Export failed (${res.status})`);
+    let blob = null;
+    if (currentVisionJobId) {
+      const token = (currentUser && currentUser.token) || "";
+      const res = await fetch(`/api/vision/export/${currentVisionJobId}?format=${format}`, {
+        headers: token ? { "Authorization": `Bearer ${token}` } : {}
+      });
+      if (res.ok) {
+        blob = await res.blob();
+      } else if (res.status !== 404 || !visionActiveTelemetry) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.message || `Export failed (${res.status})`);
+      }
     }
-    const blob = await res.blob();
+
+    if (!blob && visionActiveTelemetry) {
+      const passages = Array.isArray(visionActiveTelemetry.passage_events)
+        ? visionActiveTelemetry.passage_events
+        : [];
+      if (String(format).toLowerCase() === "json") {
+        const jsonPayload = JSON.stringify(
+          {
+            success: true,
+            job_id: currentVisionJobId || "serverless_session",
+            timestamp: new Date().toISOString(),
+            data: {
+              total_unique_vehicles: visionActiveTelemetry.total_unique_vehicles ?? 0,
+              class_counts: visionActiveTelemetry.class_counts ?? {},
+              pcu_telemetry: visionActiveTelemetry.pcu_telemetry ?? {},
+              kinematics: visionActiveTelemetry.kinematics ?? {},
+              passage_events: passages,
+            },
+          },
+          null,
+          2
+        );
+        blob = new Blob([jsonPayload], { type: "application/json;charset=utf-8" });
+      } else {
+        const lines = ["passage_id,track_id,class_name,tripwire_name,direction,timestamp_sec,speed_kmh,frame_idx"];
+        for (const ev of passages) {
+          lines.push(
+            `${ev.passage_id ?? ""},${ev.track_id ?? ""},${ev.class_name ?? ""},${ev.tripwire_name ?? ""},${ev.direction ?? ""},${ev.timestamp_sec ?? ""},${ev.speed_kmh ?? ""},${ev.frame_idx ?? ""}`
+          );
+        }
+        blob = new Blob([lines.join("\n") + "\n"], { type: "text/csv;charset=utf-8" });
+      }
+    }
+
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `passage_telemetry_${currentVisionJobId}.${format}`;
+    a.download = `passage_telemetry_${currentVisionJobId || "vision"}.${format}`;
     document.body.appendChild(a);
     a.click();
     a.remove();

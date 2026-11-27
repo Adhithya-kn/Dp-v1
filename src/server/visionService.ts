@@ -9,12 +9,14 @@ import { roundTo } from "./physics.ts";
 import { getRoadName, normalizeCorridorId, ROAD_REGISTRY } from "./roadRegistry.ts";
 import { isValidIdentifier, nowIso } from "./services.ts";
 import {
+  trackAndAnalyzeFrames,
   type DetectionBox,
+  type FrameDetectionsInput,
   type TrackSummary,
   type TrackedFrameOutput,
   type UniqueClassCounts,
 } from "./cvTracker.ts";
-import { analyzeFramesWithYolo11, isYolo11ModelReady } from "./yolo11Engine.ts";
+import { analyzeFramesWithYolo11, detectImageBuffersWithYolo11, isYolo11ModelReady } from "./yolo11Engine.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -1093,318 +1095,20 @@ export class VisionService {
           this.saveJob(job);
         },
       });
-      const provenanceCode = "YOLOV11_ONNX_LOCAL";
-      const provenanceLabel = "Ultralytics YOLOv11s (ONNX Runtime) + IoU Multi-Object Tracker";
-      const inferenceDevice = "CPU (ONNX Runtime Local)";
 
       job.progress_pct = 92;
       job.processed_frames = meta.total_frames;
       this.saveJob(job);
 
-      // 4. Aggregate real tracked detections into Indo-HCM PCU, density, kinematics, waveform & passages
-      const frameList = analysis.frames;
-      const numFrames = Math.max(frameList.length, 1);
-
-      let speedSum = 0;
-      let occSum = 0;
-      let confSum = 0;
-      let confFrames = 0;
-      let minConf = 1.0;
-      let maxConf = 0.0;
-      let totalDetections = 0;
-      let peakFrameVehicles = 0;
-      let sumFrameVehicles = 0;
-      const allIncidents: Array<{ type: string; severity: string; message: string; timestamp_sec: number }> = [];
-
-      const sampleTelemetry: Array<Record<string, unknown>> = [];
-      const frameDetections: Array<Record<string, unknown>> = [];
-
-      for (const fr of frameList) {
-        const frameVeh =
-          fr.car + fr.motorcycle + fr.auto_rickshaw + fr.bus + fr.lcv + fr.truck + fr.bicycle;
-        totalDetections += frameVeh + fr.pedestrian;
-        sumFrameVehicles += frameVeh;
-        if (frameVeh > peakFrameVehicles) peakFrameVehicles = frameVeh;
-
-        speedSum += fr.estimated_speed_kmh;
-        occSum += fr.lane_occupancy_pct;
-        if (fr.mean_confidence > 0) {
-          confSum += fr.mean_confidence;
-          confFrames++;
-          if (fr.mean_confidence < minConf) minConf = fr.mean_confidence;
-          if (fr.mean_confidence > maxConf) maxConf = fr.mean_confidence;
-        }
-
-        for (const inc of fr.incidents) {
-          allIncidents.push({ ...inc, timestamp_sec: fr.timestamp_sec });
-        }
-
-        const framePcu = roundTo(
-          fr.car * INDO_HCM_PCU.car +
-            fr.motorcycle * INDO_HCM_PCU.motorcycle +
-            fr.auto_rickshaw * INDO_HCM_PCU.auto_rickshaw +
-            fr.bus * INDO_HCM_PCU.bus +
-            fr.lcv * INDO_HCM_PCU.lcv +
-            fr.truck * INDO_HCM_PCU.truck +
-            fr.bicycle * INDO_HCM_PCU.bicycle,
-          2
-        );
-
-        sampleTelemetry.push({
-          frame_idx: Math.round(fr.timestamp_sec * meta.fps),
-          timestamp_sec: fr.timestamp_sec,
-          vehicle_count: frameVeh,
-          pedestrian_count: fr.pedestrian,
-          pcu: framePcu,
-          speed_kmh: fr.estimated_speed_kmh,
-          occupancy_pct: fr.lane_occupancy_pct,
-        });
-
-        frameDetections.push({
-          frame_index: fr.frame_index,
-          timestamp_sec: fr.timestamp_sec,
-          vehicle_count: frameVeh,
-          pedestrian_count: fr.pedestrian,
-          speed_kmh: fr.estimated_speed_kmh,
-          occupancy_pct: fr.lane_occupancy_pct,
-          class_counts: {
-            car: fr.car,
-            motorcycle: fr.motorcycle,
-            auto_rickshaw: fr.auto_rickshaw,
-            bus: fr.bus,
-            lcv: fr.lcv,
-            truck: fr.truck,
-            bicycle: fr.bicycle,
-            pedestrian: fr.pedestrian,
-          },
-          detections: fr.detections,
-        });
-      }
-
-      // Build verified per-track vehicle passage events (one entry per confirmed unique vehicle track)
-      const passageEvents: Array<Record<string, unknown>> = [];
-      let passageSeq = 1;
-      if (Array.isArray(analysis.tracks) && analysis.tracks.length > 0) {
-        for (const tr of analysis.tracks) {
-          if (tr.class_name === "pedestrian") continue;
-          const gateName =
-            tr.crossed_gate_a && tr.crossed_gate_b
-              ? "Gate_A_to_Gate_B"
-              : tr.crossed_gate_b
-                ? "Mainline_Gate_B"
-                : "Mainline_Gate_A";
-          passageEvents.push({
-            passage_id: `P${String(passageSeq).padStart(4, "0")}`,
-            track_id: tr.track_id,
-            class_name: tr.class_name,
-            tripwire_name: gateName,
-            direction: tr.direction,
-            timestamp_sec: tr.first_seen_sec,
-            speed_kmh: tr.speed_kmh,
-            frame_idx: Math.round(tr.first_seen_sec * meta.fps),
-          });
-          passageSeq++;
-        }
-      } else {
-        for (const fr of frameList) {
-          const classesInFrame: Array<[string, number]> = [
-            ["car", fr.car],
-            ["motorcycle", fr.motorcycle],
-            ["auto_rickshaw", fr.auto_rickshaw],
-            ["bus", fr.bus],
-            ["lcv", fr.lcv],
-            ["truck", fr.truck],
-            ["bicycle", fr.bicycle],
-          ];
-          for (const [clsName, cnt] of classesInFrame) {
-            for (let k = 0; k < cnt; k++) {
-              passageEvents.push({
-                passage_id: `P${String(passageSeq).padStart(4, "0")}`,
-                track_id: passageSeq,
-                class_name: clsName,
-                tripwire_name: "Mainline_Gate_A",
-                direction: analysis.dominant_flow_direction,
-                timestamp_sec: fr.timestamp_sec,
-                speed_kmh: fr.estimated_speed_kmh,
-                frame_idx: Math.round(fr.timestamp_sec * meta.fps),
-              });
-              passageSeq++;
-            }
-          }
-        }
-      }
-
-      // Exact deduplicated class counts reconciled directly with total_unique_vehicles
-      const uniqueClassCounts: Record<string, number> = {
-        car: Math.max(0, Math.round(analysis.unique_class_counts.car)),
-        motorcycle: Math.max(0, Math.round(analysis.unique_class_counts.motorcycle)),
-        auto_rickshaw: Math.max(0, Math.round(analysis.unique_class_counts.auto_rickshaw)),
-        bus: Math.max(0, Math.round(analysis.unique_class_counts.bus)),
-        lcv: Math.max(0, Math.round(analysis.unique_class_counts.lcv)),
-        truck: Math.max(0, Math.round(analysis.unique_class_counts.truck)),
-        bicycle: Math.max(0, Math.round(analysis.unique_class_counts.bicycle)),
-        pedestrian: Math.max(0, Math.round(analysis.unique_class_counts.pedestrian)),
-      };
-
-      const totalUnique =
-        uniqueClassCounts.car +
-        uniqueClassCounts.motorcycle +
-        uniqueClassCounts.auto_rickshaw +
-        uniqueClassCounts.bus +
-        uniqueClassCounts.lcv +
-        uniqueClassCounts.truck +
-        uniqueClassCounts.bicycle;
-
-      const totalPcu = roundTo(
-        uniqueClassCounts.car * INDO_HCM_PCU.car +
-          uniqueClassCounts.motorcycle * INDO_HCM_PCU.motorcycle +
-          uniqueClassCounts.auto_rickshaw * INDO_HCM_PCU.auto_rickshaw +
-          uniqueClassCounts.bus * INDO_HCM_PCU.bus +
-          uniqueClassCounts.lcv * INDO_HCM_PCU.lcv +
-          uniqueClassCounts.truck * INDO_HCM_PCU.truck +
-          uniqueClassCounts.bicycle * INDO_HCM_PCU.bicycle,
-        1
-      );
-
-      // Reconcile observed directional split to totalUnique (never a hardcoded split)
-      const dirSum = analysis.inbound_count + analysis.outbound_count;
-      let inboundCount = analysis.inbound_count;
-      let outboundCount = analysis.outbound_count;
-      if (dirSum > 0 && dirSum !== totalUnique) {
-        inboundCount = Math.round((analysis.inbound_count / dirSum) * totalUnique);
-        outboundCount = Math.max(0, totalUnique - inboundCount);
-      } else if (dirSum === 0 && totalUnique > 0) {
-        inboundCount = totalUnique;
-        outboundCount = 0;
-      }
-
-      const durationHours = Math.max(meta.duration_seconds / 3600, 1 / 3600);
-      const pcuPerHour = Math.round(totalPcu / durationHours);
-      const avgSpeed = roundTo(speedSum / numFrames, 1);
-      const avgOcc = roundTo(occSum / numFrames, 1);
-      const meanConf = confFrames > 0 ? roundTo(confSum / confFrames, 3) : 0;
-      if (confFrames === 0) {
-        minConf = 0;
-        maxConf = 0;
-      }
-      const avgFrameVehicles = roundTo(sumFrameVehicles / numFrames, 1);
-
-      const densityLevel =
-        avgOcc >= 72 || (avgSpeed > 0 && avgSpeed < 15)
-          ? "Severe"
-          : avgOcc >= 50 || (avgSpeed > 0 && avgSpeed < 24)
-            ? "High"
-            : avgOcc >= 28 || (avgSpeed > 0 && avgSpeed < 36)
-              ? "Moderate"
-              : "Low";
-
-      const losGrade =
-        densityLevel === "Severe"
-          ? "LOS F"
-          : densityLevel === "High"
-            ? "LOS D"
-            : densityLevel === "Moderate"
-              ? "LOS C"
-              : "LOS B";
-
-      const vpm = roundTo((totalUnique / Math.max(meta.duration_seconds, 1)) * 60, 1);
-      const headwaySec = totalUnique > 0 ? roundTo(meta.duration_seconds / totalUnique, 2) : 0;
-      const corridorSpanMeters = cameraRec?.is_homography_calibrated ? 50 : 40;
-      const fallbackTransitDurSec = avgSpeed > 0.5 ? roundTo(corridorSpanMeters / (avgSpeed / 3.6), 1) : 0;
-      const observedGateTransitions =
-        analysis.gate_transitions_count != null && analysis.gate_transitions_count > 0
-          ? analysis.gate_transitions_count
-          : totalUnique;
-      const medianTransitDurSec =
-        analysis.median_gate_transit_sec != null && analysis.median_gate_transit_sec > 0
-          ? analysis.median_gate_transit_sec
-          : fallbackTransitDurSec;
-
       const elapsedSec = roundTo((performance.now() - tStart) / 1000, 2);
-
-      const confidenceSummary = {
-        detection_threshold: 0.25,
-        mean_confidence: meanConf,
-        min_confidence: roundTo(minConf, 3),
-        max_confidence: roundTo(maxConf, 3),
-        total_detections: totalDetections,
-      };
-
-      const resultsPayload: Record<string, unknown> = {
-        provenance: provenanceLabel,
-        processing_provenance: provenanceCode,
-        is_simulation: false,
-        scene_summary: analysis.scene_summary,
-        disclaimer:
-          "Local server-side Ultralytics YOLOv11s (ONNX) object detection with IoU multi-object tracking and Indo-HCM PCU conversion.",
-        confidence_summary: confidenceSummary,
-        processing_metrics: {
-          detector_engine: analysis.model_used,
-          inference_device: inferenceDevice,
-          keyframes_analyzed: frameList.length,
-          processing_time_sec: elapsedSec,
-        },
-        source_video: {
-          filename: stored.filename,
-          file_size_bytes: stored.file_size_bytes,
-          resolution: `${meta.width}x${meta.height}`,
-          codec: meta.codec,
-          fps: meta.fps,
-          effective_fps: roundTo(frameList.length / Math.max(meta.duration_seconds, 1), 2),
-          frame_stride_applied: Math.max(1, Math.round(meta.total_frames / numFrames)),
-          total_source_frames: meta.total_frames,
-          total_frames_analyzed: frameList.length,
-          video_duration_seconds: meta.duration_seconds,
-        },
-        total_unique_vehicles: totalUnique,
-        pedestrian_count: uniqueClassCounts.pedestrian,
-        peak_frame_vehicles: peakFrameVehicles,
-        avg_frame_vehicles: avgFrameVehicles,
-        class_counts: uniqueClassCounts,
-        direction_counts: {
-          inbound: inboundCount,
-          outbound: outboundCount,
-          dominant: analysis.dominant_flow_direction,
-        },
-        pcu_telemetry: {
-          total_pcu: totalPcu,
-          pcu_per_hour: pcuPerHour,
-          hourly_flow_pcu_per_hr: pcuPerHour,
-          congestion_level: densityLevel,
-          los_grade: losGrade,
-        },
-        kinematics: {
-          space_mean_speed_kmh: avgSpeed,
-          calibration_status: isCalibrated ? "CALIBRATED" : "UNCALIBRATED",
-          calibration_note: isCalibrated
-            ? `Speed grounded via 4-point planar homography (${cameraRec?.camera_id}, ${cameraRec?.pixels_per_meter} px/m).`
-            : "Speed estimated via perspective vehicle-length scaling across tracked frames; assign a calibrated camera ID for planar homography.",
-        },
-        traffic_density: {
-          average_occupancy_pct: avgOcc,
-          peak_density_level: densityLevel,
-          avg_density_veh_per_km: avgSpeed > 2 ? roundTo(pcuPerHour / avgSpeed, 1) : 0,
-        },
-        density_metrics: {
-          avg_density_veh_per_km: avgSpeed > 2 ? roundTo(pcuPerHour / avgSpeed, 1) : 0,
-          peak_density_veh_per_km: avgSpeed > 2 ? roundTo((pcuPerHour / avgSpeed) * 1.25, 1) : 0,
-          average_speed_kmh: avgSpeed,
-        },
-        route_flow: {
-          transitions_count: observedGateTransitions,
-          transit_frequency_vpm: vpm,
-          average_headway_sec: headwaySec,
-          median_transit_duration_sec: medianTransitDurSec,
-        },
-        incident_summary: {
-          count: allIncidents.length,
-          incidents: allIncidents,
-        },
-        incidents: allIncidents,
-        sample_telemetry: sampleTelemetry,
-        frame_detections: frameDetections,
-        passage_events: passageEvents,
-      };
+      const { resultsPayload, confidenceSummary, provenanceLabel } = this.buildResultsPayload(
+        analysis,
+        meta,
+        { filename: stored.filename, file_size_bytes: stored.file_size_bytes },
+        cameraRec,
+        elapsedSec,
+        { clientFramePipeline: false }
+      );
 
       job.status = "COMPLETED";
       job.progress_pct = 100.0;
@@ -1430,6 +1134,515 @@ export class VisionService {
         }
       }
     }
+  }
+
+  private buildResultsPayload(
+    analysis: MultimodalAnalysisResult,
+    meta: { width: number; height: number; fps: number; duration_seconds: number; total_frames: number; codec: string },
+    sourceInfo: { filename: string; file_size_bytes: number },
+    cameraRec: CameraRecord | null,
+    elapsedSec: number,
+    opts?: { clientFramePipeline?: boolean }
+  ): {
+    resultsPayload: Record<string, unknown>;
+    confidenceSummary: {
+      detection_threshold: number;
+      mean_confidence: number;
+      min_confidence: number;
+      max_confidence: number;
+      total_detections: number;
+    };
+    provenanceLabel: string;
+  } {
+    const isCalibrated = Boolean(cameraRec?.is_homography_calibrated);
+    const provenanceCode = opts?.clientFramePipeline ? "YOLOV11_ONNX_SERVERLESS" : "YOLOV11_ONNX_LOCAL";
+    const provenanceLabel = opts?.clientFramePipeline
+      ? "Ultralytics YOLOv11s (ONNX Runtime Serverless) + IoU Multi-Object Tracker"
+      : "Ultralytics YOLOv11s (ONNX Runtime) + IoU Multi-Object Tracker";
+    const inferenceDevice = opts?.clientFramePipeline
+      ? "CPU (ONNX Runtime Serverless)"
+      : "CPU (ONNX Runtime Local)";
+
+    const frameList = analysis.frames;
+    const numFrames = Math.max(frameList.length, 1);
+
+    let speedSum = 0;
+    let occSum = 0;
+    let confSum = 0;
+    let confFrames = 0;
+    let minConf = 1.0;
+    let maxConf = 0.0;
+    let totalDetections = 0;
+    let peakFrameVehicles = 0;
+    let sumFrameVehicles = 0;
+    const allIncidents: Array<{ type: string; severity: string; message: string; timestamp_sec: number }> = [];
+
+    const sampleTelemetry: Array<Record<string, unknown>> = [];
+    const frameDetections: Array<Record<string, unknown>> = [];
+
+    for (const fr of frameList) {
+      const frameVeh =
+        fr.car + fr.motorcycle + fr.auto_rickshaw + fr.bus + fr.lcv + fr.truck + fr.bicycle;
+      totalDetections += frameVeh + fr.pedestrian;
+      sumFrameVehicles += frameVeh;
+      if (frameVeh > peakFrameVehicles) peakFrameVehicles = frameVeh;
+
+      speedSum += fr.estimated_speed_kmh;
+      occSum += fr.lane_occupancy_pct;
+      if (fr.mean_confidence > 0) {
+        confSum += fr.mean_confidence;
+        confFrames++;
+        if (fr.mean_confidence < minConf) minConf = fr.mean_confidence;
+        if (fr.mean_confidence > maxConf) maxConf = fr.mean_confidence;
+      }
+
+      for (const inc of fr.incidents) {
+        allIncidents.push({ ...inc, timestamp_sec: fr.timestamp_sec });
+      }
+
+      const framePcu = roundTo(
+        fr.car * INDO_HCM_PCU.car +
+          fr.motorcycle * INDO_HCM_PCU.motorcycle +
+          fr.auto_rickshaw * INDO_HCM_PCU.auto_rickshaw +
+          fr.bus * INDO_HCM_PCU.bus +
+          fr.lcv * INDO_HCM_PCU.lcv +
+          fr.truck * INDO_HCM_PCU.truck +
+          fr.bicycle * INDO_HCM_PCU.bicycle,
+        2
+      );
+
+      sampleTelemetry.push({
+        frame_idx: Math.round(fr.timestamp_sec * meta.fps),
+        timestamp_sec: fr.timestamp_sec,
+        vehicle_count: frameVeh,
+        pedestrian_count: fr.pedestrian,
+        pcu: framePcu,
+        speed_kmh: fr.estimated_speed_kmh,
+        occupancy_pct: fr.lane_occupancy_pct,
+      });
+
+      frameDetections.push({
+        frame_index: fr.frame_index,
+        timestamp_sec: fr.timestamp_sec,
+        vehicle_count: frameVeh,
+        pedestrian_count: fr.pedestrian,
+        speed_kmh: fr.estimated_speed_kmh,
+        occupancy_pct: fr.lane_occupancy_pct,
+        class_counts: {
+          car: fr.car,
+          motorcycle: fr.motorcycle,
+          auto_rickshaw: fr.auto_rickshaw,
+          bus: fr.bus,
+          lcv: fr.lcv,
+          truck: fr.truck,
+          bicycle: fr.bicycle,
+          pedestrian: fr.pedestrian,
+        },
+        detections: fr.detections,
+      });
+    }
+
+    const passageEvents: Array<Record<string, unknown>> = [];
+    let passageSeq = 1;
+    if (Array.isArray(analysis.tracks) && analysis.tracks.length > 0) {
+      for (const tr of analysis.tracks) {
+        if (tr.class_name === "pedestrian") continue;
+        const gateName =
+          tr.crossed_gate_a && tr.crossed_gate_b
+            ? "Gate_A_to_Gate_B"
+            : tr.crossed_gate_b
+              ? "Mainline_Gate_B"
+              : "Mainline_Gate_A";
+        passageEvents.push({
+          passage_id: `P${String(passageSeq).padStart(4, "0")}`,
+          track_id: tr.track_id,
+          class_name: tr.class_name,
+          tripwire_name: gateName,
+          direction: tr.direction,
+          timestamp_sec: tr.first_seen_sec,
+          speed_kmh: tr.speed_kmh,
+          frame_idx: Math.round(tr.first_seen_sec * meta.fps),
+        });
+        passageSeq++;
+      }
+    } else {
+      for (const fr of frameList) {
+        const classesInFrame: Array<[string, number]> = [
+          ["car", fr.car],
+          ["motorcycle", fr.motorcycle],
+          ["auto_rickshaw", fr.auto_rickshaw],
+          ["bus", fr.bus],
+          ["lcv", fr.lcv],
+          ["truck", fr.truck],
+          ["bicycle", fr.bicycle],
+        ];
+        for (const [clsName, cnt] of classesInFrame) {
+          for (let k = 0; k < cnt; k++) {
+            passageEvents.push({
+              passage_id: `P${String(passageSeq).padStart(4, "0")}`,
+              track_id: passageSeq,
+              class_name: clsName,
+              tripwire_name: "Mainline_Gate_A",
+              direction: analysis.dominant_flow_direction,
+              timestamp_sec: fr.timestamp_sec,
+              speed_kmh: fr.estimated_speed_kmh,
+              frame_idx: Math.round(fr.timestamp_sec * meta.fps),
+            });
+            passageSeq++;
+          }
+        }
+      }
+    }
+
+    const uniqueClassCounts: Record<string, number> = {
+      car: Math.max(0, Math.round(analysis.unique_class_counts.car)),
+      motorcycle: Math.max(0, Math.round(analysis.unique_class_counts.motorcycle)),
+      auto_rickshaw: Math.max(0, Math.round(analysis.unique_class_counts.auto_rickshaw)),
+      bus: Math.max(0, Math.round(analysis.unique_class_counts.bus)),
+      lcv: Math.max(0, Math.round(analysis.unique_class_counts.lcv)),
+      truck: Math.max(0, Math.round(analysis.unique_class_counts.truck)),
+      bicycle: Math.max(0, Math.round(analysis.unique_class_counts.bicycle)),
+      pedestrian: Math.max(0, Math.round(analysis.unique_class_counts.pedestrian)),
+    };
+
+    const totalUnique =
+      uniqueClassCounts.car +
+      uniqueClassCounts.motorcycle +
+      uniqueClassCounts.auto_rickshaw +
+      uniqueClassCounts.bus +
+      uniqueClassCounts.lcv +
+      uniqueClassCounts.truck +
+      uniqueClassCounts.bicycle;
+
+    const totalPcu = roundTo(
+      uniqueClassCounts.car * INDO_HCM_PCU.car +
+        uniqueClassCounts.motorcycle * INDO_HCM_PCU.motorcycle +
+        uniqueClassCounts.auto_rickshaw * INDO_HCM_PCU.auto_rickshaw +
+        uniqueClassCounts.bus * INDO_HCM_PCU.bus +
+        uniqueClassCounts.lcv * INDO_HCM_PCU.lcv +
+        uniqueClassCounts.truck * INDO_HCM_PCU.truck +
+        uniqueClassCounts.bicycle * INDO_HCM_PCU.bicycle,
+      1
+    );
+
+    const dirSum = analysis.inbound_count + analysis.outbound_count;
+    let inboundCount = analysis.inbound_count;
+    let outboundCount = analysis.outbound_count;
+    if (dirSum > 0 && dirSum !== totalUnique) {
+      inboundCount = Math.round((analysis.inbound_count / dirSum) * totalUnique);
+      outboundCount = Math.max(0, totalUnique - inboundCount);
+    } else if (dirSum === 0 && totalUnique > 0) {
+      inboundCount = totalUnique;
+      outboundCount = 0;
+    }
+
+    const durationHours = Math.max(meta.duration_seconds / 3600, 1 / 3600);
+    const pcuPerHour = Math.round(totalPcu / durationHours);
+    const avgSpeed = roundTo(speedSum / numFrames, 1);
+    const avgOcc = roundTo(occSum / numFrames, 1);
+    const meanConf = confFrames > 0 ? roundTo(confSum / confFrames, 3) : 0;
+    if (confFrames === 0) {
+      minConf = 0;
+      maxConf = 0;
+    }
+    const avgFrameVehicles = roundTo(sumFrameVehicles / numFrames, 1);
+
+    const densityLevel =
+      avgOcc >= 72 || (avgSpeed > 0 && avgSpeed < 15)
+        ? "Severe"
+        : avgOcc >= 50 || (avgSpeed > 0 && avgSpeed < 24)
+          ? "High"
+          : avgOcc >= 28 || (avgSpeed > 0 && avgSpeed < 36)
+            ? "Moderate"
+            : "Low";
+
+    const losGrade =
+      densityLevel === "Severe"
+        ? "LOS F"
+        : densityLevel === "High"
+          ? "LOS D"
+          : densityLevel === "Moderate"
+            ? "LOS C"
+            : "LOS B";
+
+    const vpm = roundTo((totalUnique / Math.max(meta.duration_seconds, 1)) * 60, 1);
+    const headwaySec = totalUnique > 0 ? roundTo(meta.duration_seconds / totalUnique, 2) : 0;
+    const corridorSpanMeters = cameraRec?.is_homography_calibrated ? 50 : 40;
+    const fallbackTransitDurSec = avgSpeed > 0.5 ? roundTo(corridorSpanMeters / (avgSpeed / 3.6), 1) : 0;
+    const observedGateTransitions =
+      analysis.gate_transitions_count != null && analysis.gate_transitions_count > 0
+        ? analysis.gate_transitions_count
+        : totalUnique;
+    const medianTransitDurSec =
+      analysis.median_gate_transit_sec != null && analysis.median_gate_transit_sec > 0
+        ? analysis.median_gate_transit_sec
+        : fallbackTransitDurSec;
+
+    const confidenceSummary = {
+      detection_threshold: 0.25,
+      mean_confidence: meanConf,
+      min_confidence: roundTo(minConf, 3),
+      max_confidence: roundTo(maxConf, 3),
+      total_detections: totalDetections,
+    };
+
+    const resultsPayload: Record<string, unknown> = {
+      provenance: provenanceLabel,
+      processing_provenance: provenanceCode,
+      client_frame_pipeline: Boolean(opts?.clientFramePipeline),
+      is_simulation: false,
+      scene_summary: analysis.scene_summary,
+      disclaimer:
+        "Ultralytics YOLOv11s (ONNX) object detection with IoU multi-object tracking and Indo-HCM PCU conversion.",
+      confidence_summary: confidenceSummary,
+      processing_metrics: {
+        detector_engine: analysis.model_used,
+        inference_device: inferenceDevice,
+        keyframes_analyzed: frameList.length,
+        processing_time_sec: elapsedSec,
+      },
+      source_video: {
+        filename: sourceInfo.filename,
+        file_size_bytes: sourceInfo.file_size_bytes,
+        resolution: `${meta.width}x${meta.height}`,
+        codec: meta.codec,
+        fps: meta.fps,
+        effective_fps: roundTo(frameList.length / Math.max(meta.duration_seconds, 1), 2),
+        frame_stride_applied: Math.max(1, Math.round(meta.total_frames / numFrames)),
+        total_source_frames: meta.total_frames,
+        total_frames_analyzed: frameList.length,
+        video_duration_seconds: meta.duration_seconds,
+      },
+      total_unique_vehicles: totalUnique,
+      pedestrian_count: uniqueClassCounts.pedestrian,
+      peak_frame_vehicles: peakFrameVehicles,
+      avg_frame_vehicles: avgFrameVehicles,
+      class_counts: uniqueClassCounts,
+      direction_counts: {
+        inbound: inboundCount,
+        outbound: outboundCount,
+        dominant: analysis.dominant_flow_direction,
+      },
+      pcu_telemetry: {
+        total_pcu: totalPcu,
+        pcu_per_hour: pcuPerHour,
+        hourly_flow_pcu_per_hr: pcuPerHour,
+        congestion_level: densityLevel,
+        los_grade: losGrade,
+      },
+      kinematics: {
+        space_mean_speed_kmh: avgSpeed,
+        calibration_status: isCalibrated ? "CALIBRATED" : "UNCALIBRATED",
+        calibration_note: isCalibrated
+          ? `Speed grounded via 4-point planar homography (${cameraRec?.camera_id}, ${cameraRec?.pixels_per_meter} px/m).`
+          : "Speed estimated via perspective vehicle-length scaling across tracked frames; assign a calibrated camera ID for planar homography.",
+      },
+      traffic_density: {
+        average_occupancy_pct: avgOcc,
+        peak_density_level: densityLevel,
+        avg_density_veh_per_km: avgSpeed > 2 ? roundTo(pcuPerHour / avgSpeed, 1) : 0,
+      },
+      density_metrics: {
+        avg_density_veh_per_km: avgSpeed > 2 ? roundTo(pcuPerHour / avgSpeed, 1) : 0,
+        peak_density_veh_per_km: avgSpeed > 2 ? roundTo((pcuPerHour / avgSpeed) * 1.25, 1) : 0,
+        average_speed_kmh: avgSpeed,
+      },
+      route_flow: {
+        transitions_count: observedGateTransitions,
+        transit_frequency_vpm: vpm,
+        average_headway_sec: headwaySec,
+        median_transit_duration_sec: medianTransitDurSec,
+      },
+      incident_summary: {
+        count: allIncidents.length,
+        incidents: allIncidents,
+      },
+      incidents: allIncidents,
+      sample_telemetry: sampleTelemetry,
+      frame_detections: frameDetections,
+      passage_events: passageEvents,
+    };
+
+    return { resultsPayload, confidenceSummary, provenanceLabel };
+  }
+
+  public async analyzeClientFrameBatch(body: Record<string, unknown>) {
+    const rawFrames = Array.isArray(body.frames) ? body.frames : [];
+    if (rawFrames.length === 0) {
+      return {
+        code: 400,
+        body: { success: false, status: "error", message: "At least one extracted frame is required.", timestamp: nowIso() },
+      };
+    }
+    if (rawFrames.length > 8) {
+      return {
+        code: 400,
+        body: { success: false, status: "error", message: "Maximum 8 frames per batch.", timestamp: nowIso() },
+      };
+    }
+
+    const width = Math.max(64, Math.round(Number(body.width) || 960));
+    const height = Math.max(64, Math.round(Number(body.height) || 540));
+
+    const parsedFrames: Array<{ frame_index: number; timestamp_sec: number; buffer: Buffer }> = [];
+    for (let i = 0; i < rawFrames.length; i++) {
+      const item = rawFrames[i] as Record<string, unknown> | null;
+      if (!item || typeof item !== "object") continue;
+      const rawB64 = String(item.image_base64 || "");
+      const cleanB64 = rawB64.includes(",") ? rawB64.slice(rawB64.indexOf(",") + 1) : rawB64;
+      if (!cleanB64) continue;
+      const buf = Buffer.from(cleanB64, "base64");
+      if (buf.length === 0) continue;
+      parsedFrames.push({
+        frame_index: Math.max(0, Math.round(Number(item.frame_index ?? i))),
+        timestamp_sec: roundTo(Math.max(0, Number(item.timestamp_sec ?? 0)), 3),
+        buffer: buf,
+      });
+    }
+
+    if (parsedFrames.length === 0) {
+      return {
+        code: 400,
+        body: { success: false, status: "error", message: "No valid image buffers in batch.", timestamp: nowIso() },
+      };
+    }
+
+    try {
+      const result = await detectImageBuffersWithYolo11(
+        parsedFrames,
+        { width, height },
+        { baseDir: this.baseDir }
+      );
+      return {
+        code: 200,
+        body: {
+          success: true,
+          status: "success",
+          timestamp: nowIso(),
+          data: result,
+        },
+      };
+    } catch (err) {
+      return {
+        code: 500,
+        body: {
+          success: false,
+          status: "error",
+          message: err instanceof Error ? err.message : "YOLOv11s frame inference failed.",
+          timestamp: nowIso(),
+        },
+      };
+    }
+  }
+
+  public finalizeClientFrameJob(body: Record<string, unknown>, owner = "traffic_admin") {
+    const rawDetFrames = Array.isArray(body.frame_detections) ? body.frame_detections : [];
+    if (rawDetFrames.length === 0) {
+      return {
+        code: 400,
+        body: { success: false, status: "error", message: "No frame_detections provided.", timestamp: nowIso() },
+      };
+    }
+
+    const tStart = performance.now();
+    const width = Math.max(64, Math.round(Number(body.width) || 960));
+    const height = Math.max(64, Math.round(Number(body.height) || 540));
+    const fps = Math.max(1, Math.min(120, Number(body.fps) || 30));
+    const durationSec = Math.max(0.5, Number(body.duration_seconds) || rawDetFrames.length);
+    const totalFrames = Math.max(rawDetFrames.length, Math.round(durationSec * fps));
+    const filename = path.basename(String(body.filename || "uploaded_traffic.mp4")).replace(/[^a-zA-Z0-9._-]/g, "_");
+    const fileSizeBytes = Math.max(0, Math.round(Number(body.file_size_bytes) || 0));
+    const cameraId = String(body.camera_id || "").trim();
+    const cameraRec = cameraId ? this.cameraRegistry.get(cameraId) : null;
+    const modelUsed = String(body.model_used || "Ultralytics YOLO11S (ONNX)");
+
+    const frameInputs: FrameDetectionsInput[] = rawDetFrames
+      .map((item, idx) => {
+        const rec = (item && typeof item === "object" ? item : {}) as Record<string, unknown>;
+        const dets = Array.isArray(rec.detections) ? (rec.detections as DetectionBox[]) : [];
+        return {
+          frame_index: Math.max(0, Math.round(Number(rec.frame_index ?? idx))),
+          timestamp_sec: roundTo(Math.max(0, Number(rec.timestamp_sec ?? 0)), 3),
+          detections: dets,
+        };
+      })
+      .sort((a, b) => a.timestamp_sec - b.timestamp_sec);
+
+    const analysis = trackAndAnalyzeFrames(
+      frameInputs,
+      { width, height, fps, duration_seconds: durationSec, total_frames: totalFrames },
+      {
+        model_used: modelUsed,
+        pixels_per_meter: cameraRec?.pixels_per_meter,
+        is_calibrated: Boolean(cameraRec?.is_homography_calibrated),
+      }
+    );
+
+    const elapsedSec = roundTo(
+      Math.max(Number(body.client_elapsed_sec) || 0, (performance.now() - tStart) / 1000),
+      2
+    );
+    const meta = {
+      width,
+      height,
+      fps,
+      duration_seconds: roundTo(durationSec, 2),
+      total_frames: totalFrames,
+      codec: "browser-decoded",
+    };
+
+    const { resultsPayload, confidenceSummary, provenanceLabel } = this.buildResultsPayload(
+      analysis,
+      meta,
+      { filename, file_size_bytes: fileSizeBytes },
+      cameraRec,
+      elapsedSec,
+      { clientFramePipeline: true }
+    );
+
+    const videoId = `vid_${crypto.randomBytes(6).toString("hex")}`;
+    const jobId = `cv_${crypto.randomBytes(5).toString("hex")}`;
+    const job: VisionJob = {
+      job_id: jobId,
+      video_id: videoId,
+      original_filename: filename,
+      owner,
+      status: "COMPLETED",
+      progress_pct: 100.0,
+      total_frames: totalFrames,
+      processed_frames: totalFrames,
+      duration_seconds: meta.duration_seconds,
+      fps,
+      width,
+      height,
+      model_name: analysis.model_used,
+      model_status: "completed",
+      provenance: provenanceLabel,
+      camera_config: cameraRec ? (cameraRec as unknown as Record<string, unknown>) : null,
+      confidence_summary: confidenceSummary,
+      created_at: nowIso(),
+      completed_at: nowIso(),
+      output_video_path: null,
+      error_message: null,
+      results: resultsPayload,
+    };
+
+    this.saveJob(job);
+
+    return {
+      code: 200,
+      body: {
+        success: true,
+        status: "success",
+        message: "YOLOv11s frame analysis finalized.",
+        timestamp: nowIso(),
+        data: {
+          job_id: jobId,
+          video_id: videoId,
+          results: resultsPayload,
+        },
+      },
+    };
   }
 
   public getJob(jobId: string) {

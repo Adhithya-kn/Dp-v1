@@ -313,14 +313,17 @@ export function createApp(opts?: AppRuntimeOptions) {
       success: true,
       status: "success",
       cv: {
-        status: ffmpegOk && yoloOk ? "live_pipeline_ready" : "degraded_cv_pipeline",
+        status: ffmpegOk && yoloOk ? "live_pipeline_ready" : yoloOk ? "serverless_yolov11_ready" : "degraded_cv_pipeline",
         engine: yoloOk ? "Ultralytics YOLOv11s (ONNX) + IoU Tracker" : "YOLOv11s Weights Missing",
         ffmpeg_available: ffmpegOk,
         yolo_loaded: yoloOk,
+        browser_frame_mode: !ffmpegOk && yoloOk,
         message:
           ffmpegOk && yoloOk
             ? "Local FFprobe/FFmpeg frame extraction with Ultralytics YOLOv11s (ONNX) vehicle detection and IoU multi-object tracking active."
-            : "CV pipeline degraded: verify FFmpeg and models/yolo11/yolo11s.onnx.",
+            : yoloOk
+              ? "Ultralytics YOLOv11s (ONNX) active in serverless browser-keyframe mode."
+              : "CV pipeline degraded: verify models/yolo11/yolo11s.onnx.",
       },
       ml: {
         status: Object.keys(mlMetrics).length > 0 ? "measured_chronological_benchmark" : "not_measured",
@@ -1109,8 +1112,29 @@ export function createApp(opts?: AppRuntimeOptions) {
   // -------------------------------------------------------------------------
   // Computer Vision & Cameras Routes
   // -------------------------------------------------------------------------
-  app.get("/api/vision/status", (_req, res) => {
-    res.json(visionService.getStatus());
+  app.get("/api/vision/status", async (_req, res) => {
+    const statusPayload = visionService.getStatus();
+    const ffmpegOk = await visionService.checkFfmpegAvailable();
+    const yoloOk = Boolean(statusPayload?.data?.yolo_loaded);
+    res.json({
+      ...statusPayload,
+      data: {
+        ...statusPayload.data,
+        ffmpeg_available: ffmpegOk,
+        browser_frame_mode: !ffmpegOk && yoloOk,
+      },
+    });
+  });
+
+  app.post("/api/vision/detect-frames", requireAuth, async (req, res) => {
+    const result = await visionService.analyzeClientFrameBatch(req.body || {});
+    res.status(result.code).json(result.body);
+  });
+
+  app.post("/api/vision/finalize-frames", requireAuth, (req, res) => {
+    const user = res.locals.authUser as SessionRecord;
+    const result = visionService.finalizeClientFrameJob(req.body || {}, user.username);
+    res.status(result.code).json(result.body);
   });
 
   app.get("/api/vision/cameras", (req, res) => {
@@ -1310,7 +1334,12 @@ export function createApp(opts?: AppRuntimeOptions) {
       xgboost_engine: xgbOk ? "ONLINE" : "OFFLINE",
       event_manager: dbHealthy ? "ONLINE" : "DEGRADED",
       heatmap_tri_pillar: xgbOk ? "ONLINE" : "OFFLINE",
-      vision_pipeline: ffmpegOk && yoloOk ? "ONLINE (FFMPEG+YOLOV11S)" : "DEGRADED",
+      vision_pipeline:
+        ffmpegOk && yoloOk
+          ? "ONLINE (FFMPEG+YOLOV11S)"
+          : yoloOk
+            ? "ONLINE (YOLOV11S SERVERLESS)"
+            : "DEGRADED",
       live_weather_feed: weatherProbe.ok ? `ONLINE (${weatherProbe.latency_ms}ms)` : "FALLBACK",
     };
 

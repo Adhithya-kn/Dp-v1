@@ -153,12 +153,12 @@ function refineIndianTrafficClass(
 
 async function detectFrameWithYolo11(
   session: Ort.InferenceSession,
-  framePath: string,
+  frameInput: string | Buffer,
   origWidth: number,
   origHeight: number
 ): Promise<DetectionBox[]> {
   const size = YOLO11_INPUT_SIZE;
-  const imgMeta = await sharp(framePath).metadata();
+  const imgMeta = await sharp(frameInput).metadata();
   const imgW = imgMeta.width && imgMeta.width > 0 ? imgMeta.width : origWidth;
   const imgH = imgMeta.height && imgMeta.height > 0 ? imgMeta.height : origHeight;
 
@@ -168,7 +168,7 @@ async function detectFrameWithYolo11(
   const padX = Math.floor((size - resizedW) / 2);
   const padY = Math.floor((size - resizedH) / 2);
 
-  const { data } = await sharp(framePath)
+  const { data } = await sharp(frameInput)
     .resize(size, size, {
       fit: "contain",
       background: { r: 114, g: 114, b: 114, alpha: 1 },
@@ -316,4 +316,28 @@ export async function analyzeFramesWithYolo11(
     pixels_per_meter: options?.pixels_per_meter,
     is_calibrated: options?.is_calibrated,
   });
+}
+
+export async function detectImageBuffersWithYolo11(
+  frames: Array<{ frame_index: number; timestamp_sec: number; buffer: Buffer }>,
+  meta: { width: number; height: number },
+  options?: { baseDir?: string }
+): Promise<{ model_used: string; frames: FrameDetectionsInput[] }> {
+  const baseDir = options?.baseDir ?? process.cwd();
+  const { session, modelName } = await getYolo11Session(baseDir);
+
+  const outFrames: FrameDetectionsInput[] = [];
+  for (const f of frames) {
+    const detections = await detectFrameWithYolo11(session, f.buffer, meta.width, meta.height);
+    outFrames.push({
+      frame_index: f.frame_index,
+      timestamp_sec: f.timestamp_sec,
+      detections,
+    });
+  }
+
+  return {
+    model_used: `Ultralytics ${modelName.toUpperCase()} (ONNX)`,
+    frames: outFrames,
+  };
 }

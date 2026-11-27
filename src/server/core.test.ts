@@ -356,6 +356,42 @@ test("VisionService runs real local FFprobe + FFmpeg + Ultralytics YOLOv11s ONNX
     const realJob = await visionReal.waitForJob((procReal.body.data as { job_id: string }).job_id, 30_000);
     assert.equal(realJob?.status, "COMPLETED", `YOLOv11s real job failed: ${realJob?.error_message}`);
     assert.equal((realJob?.results as { processing_provenance?: string })?.processing_provenance, "YOLOV11_ONNX_LOCAL");
+
+    // 1b. Stateless serverless frame batch + finalize pipeline (used on Vercel without server FFmpeg)
+    const frameJpg1 = path.join(tmpDir, "serverless_f1.jpg");
+    const frameJpg2 = path.join(tmpDir, "serverless_f2.jpg");
+    execFileSync("ffmpeg", ["-y", "-i", clipPath, "-frames:v", "1", frameJpg1], { stdio: "ignore" });
+    execFileSync("ffmpeg", ["-y", "-ss", "0.5", "-i", clipPath, "-frames:v", "1", frameJpg2], { stdio: "ignore" });
+    const batchRes = await visionReal.analyzeClientFrameBatch({
+      width: 320,
+      height: 240,
+      frames: [
+        { frame_index: 0, timestamp_sec: 0.0, image_base64: fs.readFileSync(frameJpg1).toString("base64") },
+        { frame_index: 1, timestamp_sec: 0.5, image_base64: fs.readFileSync(frameJpg2).toString("base64") },
+      ],
+    });
+    assert.equal(batchRes.code, 200);
+    const batchFrames = (batchRes.body.data as { frames: unknown[] }).frames;
+    assert.equal(batchFrames.length, 2);
+
+    const finRes = visionReal.finalizeClientFrameJob(
+      {
+        filename: "tiny_clip.mp4",
+        file_size_bytes: clipBuf.length,
+        width: 320,
+        height: 240,
+        fps: 10,
+        duration_seconds: 1.0,
+        frame_detections: batchFrames,
+      },
+      "traffic_admin"
+    );
+    assert.equal(finRes.code, 200);
+    const finData = finRes.body.data as { job_id: string; results: Record<string, unknown> };
+    assert.ok(finData.job_id.startsWith("cv_"));
+    assert.equal(finData.results.processing_provenance, "YOLOV11_ONNX_SERVERLESS");
+    assert.equal(finData.results.client_frame_pipeline, true);
+
     // Cleanup uploaded test clip in workspace uploads dir
     if (realJob?.output_video_path && fs.existsSync(realJob.output_video_path)) {
       fs.rmSync(realJob.output_video_path, { force: true });
